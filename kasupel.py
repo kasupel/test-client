@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-import requests
+import aiohttp
 
 import socketio
 
@@ -134,8 +134,16 @@ class Client:
     def __init__(self, url: str):
         """Initialise the client with the URL of the server."""
         self.url = url
+        self._aiohttp_session = aiohttp.ClientSession()
 
-    def _post_payload(
+    @property
+    def aiohttp_session(self):
+        """Get the aiohttp session, ensuring that it's open."""
+        if self._aiohttp_session.closed:
+            self._aiohttp_session = aiohttp.ClientSession()
+        return self._aiohttp_session
+
+    async def _post_payload(
             self, endpoint: str, payload: Json, method: str = 'POST',
             encrypted: bool = False) -> Json:
         """Encrypt a payload and send it to the server."""
@@ -150,13 +158,13 @@ class Client:
                 )
             )
         method = {
-            'POST': requests.post,
-            'PATCH': requests.patch
+            'POST': self.aiohttp_session.post,
+            'PATCH': self.aiohttp_session.patch
         }[method]
-        response = method(self.url + endpoint, data=data)
-        return self._handle_response(response)
+        async with method(self.url + endpoint, data=data) as response:
+            return self._handle_response(response)
 
-    def _handle_response(self, response: requests.Response) -> Json:
+    def _handle_response(self, response: aiohttp.ClientResponse) -> Json:
         """Handle a response from the server."""
         if response.ok:
             if response.status_code == 204:
@@ -168,13 +176,13 @@ class Client:
     @functools.cached_property
     def _public_key(self) -> rsa.RSAPublicKey:
         """Get the server's public key."""
-        raw = requests.get(self.url + '/rsa_key').content
-        return serialization.load_pem_public_key(raw)
+        async with self.aiohttp_session.get(self.url + '/rsa_key') as resp:
+            return serialization.load_pem_public_key(resp.text)
 
-    def login(self, username: str, password: str) -> Session:
+    async def login(self, username: str, password: str) -> Session:
         """Log in to an account."""
         token = base64.b64encode(os.urandom(32)).decode()
-        resp = self._post_payload('/accounts/login', {
+        resp = await self._post_payload('/accounts/login', {
             'username': username,
             'password': password,
             'token': token
@@ -182,22 +190,25 @@ class Client:
         session_id = resp['session_id']
         return Session(self, token, session_id)
 
-    def get_user(self, username: str = None, user_id: int = None) -> User:
+    async def get_user(
+            self, username: str = None, user_id: int = None) -> User:
         """Get a user's account."""
         if not bool(username) ^ bool(id):
             raise TypeError('Exactly one of username or id should be passed.')
         if username:
-            resp = requests.get(self.url + '/user/' + username)
+            request = self.aiohttp_session.get(self.url + '/user/' + username)
         else:
-            resp = requests.get(
+            request = self.aiohttp_session.get(
                 self.url + '/accounts/account', params={'id': user_id}
             )
-        return User(self, self._handle_response(resp))
+        async with request as response:
+            return User(self, self._handle_response(response))
 
-    def get_game(self, game_id: int) -> Game:
+    async def get_game(self, game_id: int) -> Game:
         """Get a game by ID."""
-        resp = requests.get(self.url + '/games/' + str(game_id))
-        return Game(self, self._handle_response(resp))
+        url = self.url + '/games/' + str(game_id)
+        async with self.aiohttp_session.get(url) as resp:
+            return Game(self, self._handle_response(resp))
 
     def get_users(self, start_page: int = 0) -> Paginator:
         """Get a list of all users."""
@@ -205,18 +216,18 @@ class Client:
 
     def create_account(self, username: str, password: str, email: str):
         """Create a new user account."""
-        self._post_payload('/accounts/create', {
+        await self._post_payload('/accounts/create', {
             'username': username,
             'password': password,
             'email': email
         }, encrypted=True)
 
-    def verify_email(self, username: str, token: str):
+    async def verify_email(self, username: str, token: str):
         """Verify an email address."""
-        resp = requests.get(self.url + '/accounts/verify_email', params={
-            'username': username, 'token': token
-        })
-        self._handle_response(resp)
+        url = self.url + '/accounts/verify_email'
+        params = {'username': username, 'token': token}
+        async with self.aiohttp_session.get(url, params=params) as resp:
+            self._handle_response(resp)
 
 
 class Session:
@@ -227,8 +238,9 @@ class Session:
         self.token = token
         self.id = session_id
         self.client = client
+        self.user = None
 
-    def _get_authenticated(
+    async def _get_authenticated(
             self, endpoint: str, payload: Json = None,
             method: str = 'GET') -> Json:
         """Get an endpoint that requires authentication."""
@@ -236,59 +248,53 @@ class Session:
         payload['session_id'] = self.id
         payload['session_token'] = self.token
         method = {
-            'GET': requests.get,
-            'DELETE': requests.delete
+            'GET': self.client.aiohttp_session.get,
+            'DELETE': self.client.aiohttp_session.delete
         }[method]
-        response = method(self.client.url + endpoint, params=payload)
-        return self.client._handle_response(response)
+        async with method(self.client.url + endpoint, params=payload) as resp:
+            return self.client._handle_response(resp)
 
-    def _post_authenticated(
+    async def _post_authenticated(
             self, endpoint: str, payload: Json,
             method: str = 'POST', encrypted: bool = False) -> Json:
         """Post to an endpoint that requires authentication."""
         payload['session_id'] = self.id
         payload['session_token'] = self.token
-        return self.client._post_payload(endpoint, payload, method, encrypted)
+        return await self.client._post_payload(
+            endpoint, payload, method, encrypted
+        )
 
-    def _invalidate_user_cache(self):
-        """Invalidate the cached associated user."""
-        try:
-            del self.user    # Invalidate cache
-        except AttributeError:
-            pass             # Was not cached anyway
-
-    def logout(self):
+    async def logout(self):
         """End the session."""
-        self._get_authenticated('/accounts/logout')
+        await self._get_authenticated('/accounts/logout')
 
-    def resend_verification_email(self):
+    async def resend_verification_email(self):
         """Resend the verification email for an account."""
-        self._get_authenticated('/accounts/resend_verification_email')
+        await self._get_authenticated('/accounts/resend_verification_email')
 
-    def update(self, password: str = None, email: str = None):
+    async def update(self, password: str = None, email: str = None):
         """Update the user's account."""
         payload = {}
         if password:
             payload['password'] = password
         if email:
             payload['email'] = email
-        self._invalidate_user_cache()
-        self._post_authenticated('/accounts/me', payload, 'PATCH', True)
+        self.user = None
+        await self._post_authenticated('/accounts/me', payload, 'PATCH', True)
 
-    @functools.cached_property
-    def user(self) -> User:
+    async def fetch_user(self) -> User:
         """Get the user's account details."""
         details = self._get_authenticated('/accounts/me')
-        return User(self.client, details)
-
-    def fetch_user(self) -> User:
-        """Get the user's account details (without caching)."""
-        self._invalidate_user_cache()
+        self.user = User(self.client, details)
         return self.user
 
-    def delete(self):
+    async def get_user(self) -> User:
+        """Get the cached user, or fetch if not cached (recommended)."""
+        return self.user or await self.fetch_user()
+
+    async def delete(self):
         """Delete the user's account."""
-        self._get_authenticated('/accounts/me', method='DELETE')
+        await self._get_authenticated('/accounts/me', method='DELETE')
 
     def _get_games_paginator(
             self, endpoint: str, start_page: int,
@@ -327,14 +333,14 @@ class Session:
         """Get a list of ongoing games this user is in."""
         return self._get_games_paginator('ongoing', start_page)
 
-    def find_game(
+    async def find_game(
             self,
             main_thinking_time: datetime.timedelta,
             fixed_extra_time: datetime.timedelta,
             time_increment_per_turn: datetime.timedelta,
             mode: Gamemode) -> Game:
         """Look for or create a game."""
-        response = self._post_authenticated(
+        response = await self._post_authenticated(
             '/games/find', {
                 'main_thinking_time': dump_timedelta(main_thinking_time),
                 'fixed_extra_time': dump_timedelta(fixed_extra_time),
@@ -344,16 +350,16 @@ class Session:
                 'mode': mode.value
             }
         )
-        return self.client.get_game(response['game_id'])
+        return await self.client.get_game(response['game_id'])
 
-    def send_invitation(
+    async def send_invitation(
             self, other: User,
             main_thinking_time: datetime.timedelta,
             fixed_extra_time: datetime.timedelta,
             time_increment_per_turn: datetime.timedelta,
             mode: Gamemode) -> Game:
         """Send an invitation to another user."""
-        response = self._post_authenticated(
+        response = await self._post_authenticated(
             '/games/send_invitation', {
                 'invitee': other.username,
                 'main_thinking_time': dump_timedelta(main_thinking_time),
@@ -364,24 +370,28 @@ class Session:
                 'mode': mode.value
             }
         )
-        return self.client.get_game(response['game_id'])
+        return await self.client.get_game(response['game_id'])
 
-    def accept_invitation(self, invitation: Game):
+    async def accept_invitation(self, invitation: Game):
         """Accept a game you have been invited to."""
-        self._post_authenticated('/games/invites/' + str(invitation.id), {})
+        await self._post_authenticated(
+            '/games/invites/' + str(invitation.id), {}
+        )
 
-    def decline_invitation(self, invitation: Game):
+    async def decline_invitation(self, invitation: Game):
         """Decline a game you have been invited to."""
-        self._get_authenticated(
+        await self._get_authenticated(
             '/games/invites/' + str(invitation.id), method='DELETE'
         )
 
-    def connect_to_game(self, game: Game) -> GameConnection:
+    async def connect_to_game(self, game: Game) -> GameConnection:
         """Connect to a websocket for a game."""
-        return GameConnection(self, game)
+        connection = GameConnection(self, game)
+        await connection.connect()
+        return connection
 
 
-class GameConnection(socketio.Client):
+class GameConnection(socketio.AsyncClient):
     """A websocket connection for a game."""
 
     def __init__(self, session: Session, game: Game):
@@ -392,6 +402,7 @@ class GameConnection(socketio.Client):
         self.game_id = game.id
         self.disconnect_reason = None
         self.game_end_reason = None
+        self.game = game
         self.board = None
         self.timer = None
         self.current_turn = None
@@ -399,61 +410,77 @@ class GameConnection(socketio.Client):
         self.allowed_moves = None
         self.valid_draw_claim = None
         self.handlers = collections.defaultdict(list)
+
+        super().on('game_disconnect', self.game_disconnect_event)
+        super().on('game_start', self.game_start_event)
+        super().on('game_end', self.game_end_event)
+        super().on('draw_offer', self.draw_offer_event)
+        super().on('move', self.move_event)
+        super().on('game_state', self.game_state_event)
+        super().on('allowed_moves', self.allowed_moves_event)
+        super().on('bad_request', self.on_error)
+
+    async def connect(self):
         session_token = base64.b64encode(self.session.token)
         headers = {
             'Game-ID': self.game_id,
             'Authorization': f'SessionKey {self.session.id}|{session_token}'
         }
-        self.connect(self.client.url, headers=headers)
+        await super().connect(self.client.url, headers=headers)
 
-    def _invalidate_game_cache(self):
-        """Invalidate the cached associated game."""
-        try:
-            del self.game    # Invalidate cache
-        except AttributeError:
-            pass             # Was not cached anyway
+    async def fetch_game(self) -> Game:
+        """Fetch the game associated with this socket."""
+        self.game = await self.client.get_game(self.game_id)
+        return self.game
 
-    @functools.cached_property
-    def game(self) -> Game:
-        """Get the latest version of the game this socket is for."""
-        return self.client.get_game(self.game_id)
+    async def get_game(self) -> Game:
+        """Get the cached game if it's cached or fetch if not."""
+        return self.game or await self.fetch_game()
 
-    def request_game_state(self):
+    async def request_game_state(self):
         """Request the current state of the game."""
-        self.emit('game_state')
+        await self.emit('game_state')
 
-    def request_allowed_moves(self):
+    def get_game_state(self):
+        """Request and wait for the current state of the game (blocking)."""
+        self.call('game_state')
+
+    async def request_allowed_moves(self):
         """Request the moves we are allowed to make."""
-        self.emit('allowed_moves')
+        await self.emit('allowed_moves')
 
-    def make_move(self, move: Move):
+    def get_allowed_moves(self):
+        """Request and wait for valid moves (blocking)."""
+        self.call('allowed_moves')
+
+    async def make_move(self, move: Move):
         """Make a move."""
-        self.emit('move', move.to_json())
+        await self.emit('move', move.to_json())
 
-    def offer_draw(self):
+    async def offer_draw(self):
         """Offer our opponent a draw."""
-        self.emit('offer_draw')
+        await self.emit('offer_draw')
 
-    def claim_draw(self, reason: Conclusion):
+    async def claim_draw(self, reason: Conclusion):
         """Claim a draw."""
-        self.emit('claim_draw', reason.value)
+        await self.emit('claim_draw', reason.value)
 
-    def resign(self):
+    async def resign(self):
         """Resign from the game."""
-        self.emit('resign')
+        await self.emit('resign')
 
     def on(self, event: Event) -> typing.Callable:
         """Generate a wrapper for adding an event handler."""
-        def wrapper(callback: typing.Callable) -> typing.Callable:
+        def wrapper(callback: typing.Awaitable) -> typing.Awaitable:
             """Wrap a function to add an event handler."""
             self.handlers[event].append(callback)
             return callback
         return wrapper
 
-    def dispatch(self, event: Event, *args: typing.Tuple[typing.Any]):
+    async def dispatch(self, event: Event, *args: typing.Tuple[typing.Any]):
         """Dispatch an event to registered handlers."""
         for handler in self.handlers[event]:
-            handler(*args)
+            await handler(*args)
 
     def _load_game_state(
             self, board: Json, home_time: int, away_time: int, last_turn: int,
@@ -472,44 +499,49 @@ class GameConnection(socketio.Client):
         ]
         self.valid_draw_claim = Conclusion(draw_claim) if draw_claim else None
 
-    def game_disconnect_event(self, reason: int):
+    async def game_disconnect_event(self, reason: int):
         """Handle an event indicating that we will be disconnected."""
         self.disconnect_reason = DisconnectReason(reason)
-        self.dispatch(Event.DISCONNECT, self.disconnect_reason)
+        await self.dispatch(Event.DISCONNECT, self.disconnect_reason)
 
-    def game_start_event(self):
+    async def game_start_event(self):
         """Handle the game starting."""
-        self._invalidate_game_cache()
-        self.dispatch(Event.GAME_START)
+        self.game = None
+        await self.dispatch(Event.GAME_START)
 
-    def game_end_event(self, game_state: Json, reason: int):
+    async def game_end_event(self, game_state: Json, reason: int):
         """Handle the game ending."""
-        self._invalidate_game_cache()
+        self.game = None
         self.game_end_reason = Conclusion(reason)
         self._load_game_state(**game_state)
-        self.dispatch(Event.GAME_END, self.game_end_reason)
+        await self.dispatch(Event.GAME_END, self.game_end_reason)
 
-    def draw_offer_event(self):
+    async def draw_offer_event(self):
         """Handle a draw being offered."""
-        self._invalidate_game_cache()
-        self.dispatch(Event.DRAW_OFFER)
+        self.game = None
+        await self.dispatch(Event.DRAW_OFFER)
 
-    def move_event(self, move: Json, game_state: Json, allowed_moves: Json):
+    async def move_event(
+            self, move: Json, game_state: Json, allowed_moves: Json):
         """Handle our opponent making a move."""
         move = self.game.move_class(move)
         self._load_game_state(**game_state)
         self._load_allowed_moves(**allowed_moves)
-        self.dispatch(
+        await self.dispatch(
             Event.MOVE, move, self.allowed_moves, self.valid_draw_claim
         )
 
-    def game_state_event(self, **game_state: Json):
+    async def game_state_event(self, **game_state: Json):
         """Handle the game state being sent."""
         self._load_game_state(**game_state)
 
-    def allowed_moves_event(self, **allowed_moves: Json):
+    async def allowed_moves_event(self, **allowed_moves: Json):
         """Handle the allowed moves being sent."""
         self._load_allowed_moves(**allowed_moves)
+
+    async def on_error(self, **error: Json):
+        """Handle an error being returned by the server."""
+        raise RequestError(error)
 
 
 class User:
@@ -603,13 +635,14 @@ class Paginator:
         self._reference_fields = reference_fields or {}
         self._model = model
 
-    def _get_page(self):
+    async def _get_page(self):
         """Fetch the current page."""
         self._params['page'] = self.page_number
-        response = requests.get(
+        request = self.client.aiohttp_session.get(
             self.client.url + self._endpoint, params=self._params
         )
-        raw = self.client._handle_response(response)
+        async with request as resp:
+            raw = self.client._handle_response(resp)
         self.pages = raw['pages']
         self._page = []
         for data in raw[self._main_field]:
@@ -621,14 +654,14 @@ class Paginator:
                         ][str(data[field])]
             self._page.append(self._model(self.client, data))
 
-    def __iter__(self) -> Paginator:
+    async def __aiter__(self) -> Paginator:
         """Initialise this as an iterable."""
         self._index = 0
-        self._get_page()
+        await self._get_page()
         self.per_page = len(self._page)
         return self
 
-    def __next__(self) -> User:
+    async def __anext__(self) -> User:
         """Get the next item."""
         if self._index < len(self._page):
             value = self._page[self._index]
@@ -636,7 +669,7 @@ class Paginator:
             return value
         elif self.page_number + 1 < self.pages:
             self.page_number += 1
-            self._get_page()
+            await self._get_page()
             self._index = 1
             return self._page[0]
         else:
