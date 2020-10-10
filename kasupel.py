@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import collections
 import datetime
 import enum
 import functools
@@ -61,6 +62,13 @@ class Gamemode(enum.Enum):
 
     CHESS = enum.auto()
 
+    @property
+    def move_class(self) -> Move:
+        """Get the relevant class for moves."""
+        return {
+            self.CHESS: ChessMove
+        }[self]
+
 
 class Winner(enum.Enum):
     """An enum for the winner of a game."""
@@ -91,7 +99,7 @@ class Side(enum.Enum):
     AWAY = enum.auto()
 
 
-class PieceType(enum.Enum):
+class Piece(enum.Enum):
     """An enum for a chess piece type."""
 
     PAWN = enum.auto()
@@ -100,6 +108,24 @@ class PieceType(enum.Enum):
     BISHOP = enum.auto()
     QUEEN = enum.auto()
     KING = enum.auto()
+
+
+class Event(enum.Enum):
+    """An enum for an incoming event."""
+
+    DISCONNECT = enum.auto()
+    GAME_START = enum.auto()
+    GAME_END = enum.auto()
+    DRAW_OFFER = enum.auto()
+    MOVE = enum.auto()
+
+
+class DisconnectReason(enum.Enum):
+    """An reason for being disconnected."""
+
+    INVITE_DECLINED = enum.auto()
+    NEW_CONNECTION = enum.auto()
+    GAME_OVER = enum.auto()
 
 
 class Client:
@@ -229,7 +255,7 @@ class Session:
         try:
             del self.user    # Invalidate cache
         except AttributeError:
-            pass             # Was not cached anway
+            pass             # Was not cached anyway
 
     def logout(self):
         """End the session."""
@@ -340,7 +366,7 @@ class Session:
         )
         return self.client.get_game(response['game_id'])
 
-    def accept_inivitation(self, invitation: Game):
+    def accept_invitation(self, invitation: Game):
         """Accept a game you have been invited to."""
         self._post_authenticated('/games/invites/' + str(invitation.id), {})
 
@@ -363,13 +389,34 @@ class GameConnection(socketio.Client):
         super().__init__()
         self.session = session
         self.client = session.client
-        self.game = game
+        self.game_id = game.id
+        self.disconnect_reason = None
+        self.game_end_reason = None
+        self.board = None
+        self.timer = None
+        self.current_turn = None
+        self.turn_number = None
+        self.allowed_moves = None
+        self.valid_draw_claim = None
+        self.handlers = collections.defaultdict(list)
         session_token = base64.b64encode(self.session.token)
         headers = {
-            'Game-ID': game.id,
+            'Game-ID': self.game_id,
             'Authorization': f'SessionKey {self.session.id}|{session_token}'
         }
         self.connect(self.client.url, headers=headers)
+
+    def _invalidate_game_cache(self):
+        """Invalidate the cached associated game."""
+        try:
+            del self.game    # Invalidate cache
+        except AttributeError:
+            pass             # Was not cached anyway
+
+    @functools.cached_property
+    def game(self) -> Game:
+        """Get the latest version of the game this socket is for."""
+        return self.client.get_game(self.game_id)
 
     def request_game_state(self):
         """Request the current state of the game."""
@@ -379,17 +426,9 @@ class GameConnection(socketio.Client):
         """Request the moves we are allowed to make."""
         self.emit('allowed_moves')
 
-    def make_move(
-            self, start_rank: int, start_file: int, end_rank: int,
-            end_file: int, promotion: typing.Optional[PieceType] = None):
+    def make_move(self, move: Move):
         """Make a move."""
-        self.emit('move', {
-            'start_rank': start_rank,
-            'start_file': start_file,
-            'end_rank': end_rank,
-            'end_file': end_file,
-            'promotion': (promotion.value if promotion else None)
-        })
+        self.emit('move', move.to_json())
 
     def offer_draw(self):
         """Offer our opponent a draw."""
@@ -403,7 +442,74 @@ class GameConnection(socketio.Client):
         """Resign from the game."""
         self.emit('resign')
 
-    # TODO: Accept incoming events.
+    def on(self, event: Event) -> typing.Callable:
+        """Generate a wrapper for adding an event handler."""
+        def wrapper(callback: typing.Callable) -> typing.Callable:
+            """Wrap a function to add an event handler."""
+            self.handlers[event].append(callback)
+            return callback
+        return wrapper
+
+    def dispatch(self, event: Event, *args: typing.Tuple[typing.Any]):
+        """Dispatch an event to registered handlers."""
+        for handler in self.handlers[event]:
+            handler(*args)
+
+    def _load_game_state(
+            self, board: Json, home_time: int, away_time: int, last_turn: int,
+            current_turn: int, turn_number: int):
+        """Load the current state of the game."""
+        self.board = Board(board)
+        self.timer = Timer(home_time, away_time, last_turn)
+        self.current_turn = Side(current_turn)
+        self.turn_number = turn_number
+
+    def _load_allowed_moves(
+            self, moves: typing.List[Json], draw_claim: typing.Optional[int]):
+        """Load allowed moves."""
+        self.allowed_moves = [
+            self.game.mode.move_class(**args) for args in moves
+        ]
+        self.valid_draw_claim = Conclusion(draw_claim) if draw_claim else None
+
+    def game_disconnect_event(self, reason: int):
+        """Handle an event indicating that we will be disconnected."""
+        self.disconnect_reason = DisconnectReason(reason)
+        self.dispatch(Event.DISCONNECT, self.disconnect_reason)
+
+    def game_start_event(self):
+        """Handle the game starting."""
+        self._invalidate_game_cache()
+        self.dispatch(Event.GAME_START)
+
+    def game_end_event(self, game_state: Json, reason: int):
+        """Handle the game ending."""
+        self._invalidate_game_cache()
+        self.game_end_reason = Conclusion(reason)
+        self._load_game_state(**game_state)
+        self.dispatch(Event.GAME_END, self.game_end_reason)
+
+    def draw_offer_event(self):
+        """Handle a draw being offered."""
+        self._invalidate_game_cache()
+        self.dispatch(Event.DRAW_OFFER)
+
+    def move_event(self, move: Json, game_state: Json, allowed_moves: Json):
+        """Handle our opponent making a move."""
+        move = self.game.move_class(move)
+        self._load_game_state(**game_state)
+        self._load_allowed_moves(**allowed_moves)
+        self.dispatch(
+            Event.MOVE, move, self.allowed_moves, self.valid_draw_claim
+        )
+
+    def game_state_event(self, **game_state: Json):
+        """Handle the game state being sent."""
+        self._load_game_state(**game_state)
+
+    def allowed_moves_event(self, **allowed_moves: Json):
+        """Handle the allowed moves being sent."""
+        self._load_allowed_moves(**allowed_moves)
 
 
 class User:
@@ -537,5 +643,94 @@ class Paginator:
             raise StopIteration
 
     def __len__(self) -> int:
-        """Calculate an aproximate for the number of items."""
+        """Calculate an approximate for the number of items."""
         return self.pages * self.per_page
+
+
+class Board:
+    """A class representing the current state of a board."""
+
+    Square = collections.namedtuple('Square', ['piece', 'side'])
+
+    def __init__(self, raw_data: Json):
+        """Load the raw data."""
+        self.squares = {}
+        for position in raw_data:
+            rank, file = raw_data.split(',')
+            raw_piece, raw_side = raw_data[position]
+            square = self.Square(Piece(raw_piece), Side(raw_side))
+            self.squares[rank, file] = square
+
+    def __getitem__(self, position: typing.Tuple) -> Board.Square:
+        """Get a square by rank and file."""
+        return self.squares[position]
+
+
+class Timer:
+    """A class representing the clocks in a game."""
+
+    def __init__(self, home_time: int, away_time: int, last_turn: int):
+        """Load the current times."""
+        self.last_turn = load_timestamp(last_turn)
+        self.home_time_last = load_timedelta(home_time)
+        self.away_time_last = load_timedelta(away_time)
+
+    @property
+    def home_time(self) -> datetime.timedelta:
+        """Get the actual home time."""
+        return self.home_time_last + self.last_turn - datetime.datetime.now()
+
+    @property
+    def away_time(self) -> datetime.timedelta:
+        """Get the actual away time."""
+        return self.away_time_last + self.last_turn - datetime.datetime.now()
+
+
+class Move:
+    """A class representing a move being made in some gamemode."""
+
+    @classmethod
+    def from_json(cls, **data: Json) -> Move:
+        """Load a move from raw values."""
+        raise NotImplementedError('This should be implemented in subclasses.')
+
+    def __init__(self, **data: Json):
+        """Store associated data."""
+        raise NotImplementedError('This should be implemented in subclasses.')
+
+    def to_json(self) -> Json:
+        """Convert to a JSON-serialisable dict."""
+        raise NotImplementedError('This should be implemented in subclasses.')
+
+
+class ChessMove(Move):
+    """A class representing a move in chess."""
+
+    @classmethod
+    def from_json(
+            cls, start_rank: int, start_file: int, end_rank: int,
+            end_file: int, promotion: typing.Optional[int]) -> ChessMove:
+        """Load a move from raw values."""
+        if promotion:
+            promotion = Piece(promotion)
+        return cls(start_rank, start_file, end_rank, end_file, promotion)
+
+    def __init__(
+            self, start_rank: int, start_file: int, end_rank: int,
+            end_file: int, promotion: typing.Optional[Piece]):
+        """Store associated data."""
+        self.start_rank = start_rank
+        self.start_file = start_file
+        self.end_rank = end_rank
+        self.end_file = end_file
+        self.promotion = promotion
+
+    def to_json(self) -> Json:
+        """Convert to a JSON-serialisable dict."""
+        return {
+            'start_rank': self.start_rank,
+            'start_file': self.start_file,
+            'end_rank': self.end_rank,
+            'end_file': self.end_file,
+            'promotion': self.promotion.value if self.promotion else None
+        }
