@@ -10,12 +10,12 @@ import json
 import os
 import typing
 
+import aiohttp
+
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric import rsa
-
-import aiohttp
 
 import socketio
 
@@ -149,7 +149,7 @@ class Client:
         """Encrypt a payload and send it to the server."""
         data = json.dumps(payload, separators=(',', ':')).encode()
         if encrypted:
-            data = self._public_key.encrypt(
+            data = self._public_key().encrypt(
                 data,
                 padding.OAEP(
                     mgf=padding.MGF1(algorithm=hashes.SHA256()),
@@ -173,8 +173,8 @@ class Client:
                 return response.json()
         raise RequestError(response.json())
 
-    @functools.cached_property
-    def _public_key(self) -> rsa.RSAPublicKey:
+    @functools.lru_cache(1)    # Cache with size 1 since it won't change.
+    async def _public_key(self) -> rsa.RSAPublicKey:
         """Get the server's public key."""
         async with self.aiohttp_session.get(self.url + '/rsa_key') as resp:
             return serialization.load_pem_public_key(resp.text)
@@ -214,13 +214,21 @@ class Client:
         """Get a list of all users."""
         return Paginator(self, '/accounts/all', 'users', User, start_page)
 
-    def create_account(self, username: str, password: str, email: str):
+    async def create_account(self, username: str, password: str, email: str):
         """Create a new user account."""
         await self._post_payload('/accounts/create', {
             'username': username,
             'password': password,
             'email': email
         }, encrypted=True)
+
+    def on(self, event: Event) -> typing.Callable:
+        """Register a socket event listener.
+
+        This will only ever be called if you create and connect a
+        GameConnection instance.
+        """
+        return GameConnection.on(event)
 
     async def verify_email(self, username: str, token: str):
         """Verify an email address."""
@@ -394,6 +402,26 @@ class Session:
 class GameConnection(socketio.AsyncClient):
     """A websocket connection for a game."""
 
+    _connections = []
+    handlers = collections.defaultdict(list)
+
+    @classmethod
+    def on(cls, event: Event) -> typing.Callable:
+        """Generate a wrapper for adding an event handler."""
+        def wrapper(callback: typing.Awaitable) -> typing.Awaitable:
+            """Wrap a function to add an event handler."""
+            cls.handlers[event].append(callback)
+            return callback
+        return wrapper
+
+    @classmethod
+    async def dispatch(
+            cls, event: Event, instance: GameConnection,
+            *args: typing.Tuple[typing.Any]):
+        """Dispatch an event to registered handlers."""
+        for handler in cls.handlers[event]:
+            await handler(instance, *args)
+
     def __init__(self, session: Session, game: Game):
         """Connect to the game."""
         super().__init__()
@@ -409,7 +437,6 @@ class GameConnection(socketio.AsyncClient):
         self.turn_number = None
         self.allowed_moves = None
         self.valid_draw_claim = None
-        self.handlers = collections.defaultdict(list)
 
         super().on('game_disconnect', self.game_disconnect_event)
         super().on('game_start', self.game_start_event)
@@ -420,13 +447,26 @@ class GameConnection(socketio.AsyncClient):
         super().on('allowed_moves', self.allowed_moves_event)
         super().on('bad_request', self.on_error)
 
+        super().on('connect', self.on_connect)
+        super().on('disconnect', self.on_disconnect)
+
     async def connect(self):
+        """Connect to the server."""
         session_token = base64.b64encode(self.session.token)
         headers = {
             'Game-ID': self.game_id,
             'Authorization': f'SessionKey {self.session.id}|{session_token}'
         }
         await super().connect(self.client.url, headers=headers)
+
+    async def on_connect(self):
+        """Add this instance to the list of connections."""
+        type(self)._connections.append(self)
+
+    async def on_disconnect(self):
+        """Remove this instance from the list of connections."""
+        if self in type(self)._connections:
+            type(self)._connections.remove(self)
 
     async def fetch_game(self) -> Game:
         """Fetch the game associated with this socket."""
@@ -469,19 +509,6 @@ class GameConnection(socketio.AsyncClient):
         """Resign from the game."""
         await self.emit('resign')
 
-    def on(self, event: Event) -> typing.Callable:
-        """Generate a wrapper for adding an event handler."""
-        def wrapper(callback: typing.Awaitable) -> typing.Awaitable:
-            """Wrap a function to add an event handler."""
-            self.handlers[event].append(callback)
-            return callback
-        return wrapper
-
-    async def dispatch(self, event: Event, *args: typing.Tuple[typing.Any]):
-        """Dispatch an event to registered handlers."""
-        for handler in self.handlers[event]:
-            await handler(*args)
-
     def _load_game_state(
             self, board: Json, home_time: int, away_time: int, last_turn: int,
             current_turn: int, turn_number: int):
@@ -502,24 +529,26 @@ class GameConnection(socketio.AsyncClient):
     async def game_disconnect_event(self, reason: int):
         """Handle an event indicating that we will be disconnected."""
         self.disconnect_reason = DisconnectReason(reason)
-        await self.dispatch(Event.DISCONNECT, self.disconnect_reason)
+        await type(self).dispatch(
+            Event.DISCONNECT, self, self.disconnect_reason
+        )
 
     async def game_start_event(self):
         """Handle the game starting."""
         self.game = None
-        await self.dispatch(Event.GAME_START)
+        await type(self).dispatch(Event.GAME_START, self)
 
     async def game_end_event(self, game_state: Json, reason: int):
         """Handle the game ending."""
         self.game = None
         self.game_end_reason = Conclusion(reason)
         self._load_game_state(**game_state)
-        await self.dispatch(Event.GAME_END, self.game_end_reason)
+        await type(self).dispatch(Event.GAME_END, self, self.game_end_reason)
 
     async def draw_offer_event(self):
         """Handle a draw being offered."""
         self.game = None
-        await self.dispatch(Event.DRAW_OFFER)
+        await type(self).dispatch(Event.DRAW_OFFER, self)
 
     async def move_event(
             self, move: Json, game_state: Json, allowed_moves: Json):
@@ -527,8 +556,8 @@ class GameConnection(socketio.AsyncClient):
         move = self.game.move_class(move)
         self._load_game_state(**game_state)
         self._load_allowed_moves(**allowed_moves)
-        await self.dispatch(
-            Event.MOVE, move, self.allowed_moves, self.valid_draw_claim
+        await type(self).dispatch(
+            Event.MOVE, self, move, self.allowed_moves, self.valid_draw_claim
         )
 
     async def game_state_event(self, **game_state: Json):
@@ -752,6 +781,7 @@ class ChessMove(Move):
             self, start_rank: int, start_file: int, end_rank: int,
             end_file: int, promotion: typing.Optional[Piece]):
         """Store associated data."""
+        super().__init__()
         self.start_rank = start_rank
         self.start_file = start_file
         self.end_rank = end_rank
