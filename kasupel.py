@@ -5,7 +5,6 @@ import base64
 import collections
 import datetime
 import enum
-import functools
 import json
 import os
 import typing
@@ -54,7 +53,12 @@ class RequestError(Exception):
         """Store the code and message to be handled."""
         self.code = error['error']
         self.message = error['message']
-        super().__init__(f'ERR{self.code}: {self.message}.')
+        super().__init__(f'ERR{self.code}: {self.message}')
+
+    def is_code(self, code: int):
+        """Reraise the error if it is not in some code range."""
+        if not str(self.code).startswith(str(code).rstrip('0')):
+            raise self from self
 
 
 class Gamemode(enum.Enum):
@@ -134,10 +138,15 @@ class Client:
     def __init__(self, url: str):
         """Initialise the client with the URL of the server."""
         self.url = url
+        self._public_key = None
         self._aiohttp_session = aiohttp.ClientSession()
 
+    async def close(self):
+        """Close the HTTP session."""
+        await self._aiohttp_session.close()
+
     @property
-    def aiohttp_session(self):
+    def aiohttp_session(self) -> aiohttp.ClientSession:
         """Get the aiohttp session, ensuring that it's open."""
         if self._aiohttp_session.closed:
             self._aiohttp_session = aiohttp.ClientSession()
@@ -149,7 +158,7 @@ class Client:
         """Encrypt a payload and send it to the server."""
         data = json.dumps(payload, separators=(',', ':')).encode()
         if encrypted:
-            data = self._public_key().encrypt(
+            data = (await self._get_public_key()).encrypt(
                 data,
                 padding.OAEP(
                     mgf=padding.MGF1(algorithm=hashes.SHA256()),
@@ -162,22 +171,27 @@ class Client:
             'PATCH': self.aiohttp_session.patch
         }[method]
         async with method(self.url + endpoint, data=data) as response:
-            return self._handle_response(response)
+            return await self._handle_response(response)
 
-    def _handle_response(self, response: aiohttp.ClientResponse) -> Json:
+    async def _handle_response(
+            self, response: aiohttp.ClientResponse) -> Json:
         """Handle a response from the server."""
-        if response.ok:
-            if response.status_code == 204:
-                return {}
-            else:
-                return response.json()
-        raise RequestError(response.json())
+        if response.status == 200:
+            return await response.json()
+        elif response.status == 204:
+            return {}
+        raise RequestError(await response.json())
 
-    @functools.lru_cache(1)    # Cache with size 1 since it won't change.
-    async def _public_key(self) -> rsa.RSAPublicKey:
+    async def _fetch_public_key(self) -> rsa.RSAPublicKey:
         """Get the server's public key."""
         async with self.aiohttp_session.get(self.url + '/rsa_key') as resp:
-            return serialization.load_pem_public_key(resp.text)
+            key_as_pem = await resp.content.read()
+            self._public_key = serialization.load_pem_public_key(key_as_pem)
+            return self._public_key
+
+    async def _get_public_key(self) -> rsa.RSAPublicKey:
+        """Get the server's public key with caching."""
+        return self._public_key or await self._fetch_public_key()
 
     async def login(self, username: str, password: str) -> Session:
         """Log in to an account."""
@@ -202,13 +216,13 @@ class Client:
                 self.url + '/accounts/account', params={'id': user_id}
             )
         async with request as response:
-            return User(self, self._handle_response(response))
+            return User(self, await self._handle_response(response))
 
     async def get_game(self, game_id: int) -> Game:
         """Get a game by ID."""
         url = self.url + '/games/' + str(game_id)
         async with self.aiohttp_session.get(url) as resp:
-            return Game(self, self._handle_response(resp))
+            return Game(self, await self._handle_response(resp))
 
     def get_users(self, start_page: int = 0) -> Paginator:
         """Get a list of all users."""
@@ -235,7 +249,7 @@ class Client:
         url = self.url + '/accounts/verify_email'
         params = {'username': username, 'token': token}
         async with self.aiohttp_session.get(url, params=params) as resp:
-            self._handle_response(resp)
+            await self._handle_response(resp)
 
 
 class Session:
@@ -260,7 +274,7 @@ class Session:
             'DELETE': self.client.aiohttp_session.delete
         }[method]
         async with method(self.client.url + endpoint, params=payload) as resp:
-            return self.client._handle_response(resp)
+            return await self.client._handle_response(resp)
 
     async def _post_authenticated(
             self, endpoint: str, payload: Json,
@@ -292,7 +306,7 @@ class Session:
 
     async def fetch_user(self) -> User:
         """Get the user's account details."""
-        details = self._get_authenticated('/accounts/me')
+        details = await self._get_authenticated('/accounts/me')
         self.user = User(self.client, details)
         return self.user
 
@@ -671,7 +685,11 @@ class Paginator:
             self.client.url + self._endpoint, params=self._params
         )
         async with request as resp:
-            raw = self.client._handle_response(resp)
+            try:
+                raw = await self.client._handle_response(resp)
+            except RequestError as e:
+                e.is_code(3201)
+                return
         self.pages = raw['pages']
         self._page = []
         for data in raw[self._main_field]:
@@ -683,10 +701,12 @@ class Paginator:
                         ][str(data[field])]
             self._page.append(self._model(self.client, data))
 
-    async def __aiter__(self) -> Paginator:
+    def __aiter__(self) -> Paginator:
         """Initialise this as an iterable."""
         self._index = 0
-        await self._get_page()
+        self._page = []
+        self.page_number = -1
+        self.pages = float('inf')
         self.per_page = len(self._page)
         return self
 
@@ -699,10 +719,12 @@ class Paginator:
         elif self.page_number + 1 < self.pages:
             self.page_number += 1
             await self._get_page()
+            if not self._page:
+                raise StopAsyncIteration
             self._index = 1
             return self._page[0]
         else:
-            raise StopIteration
+            raise StopAsyncIteration
 
     def __len__(self) -> int:
         """Calculate an approximate for the number of items."""
